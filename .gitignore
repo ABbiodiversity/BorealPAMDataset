@@ -1,0 +1,52 @@
+# Credentials and local environment
+.Renviron
+.env
+.env.*
+login.R
+wt_auth.R
+credentials/
+secrets/
+
+# R session and IDE state
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# Python state
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Data, downloaded media, and generated outputs
+data/
+data-raw/
+downloads/
+audio/
+output/
+outputs/
+results/
+artifacts/
+logs/
+
+*.rds
+*.RData
+*.Rdata
+*.csv
+*.tsv
+*.xlsx
+*.parquet
+*.wav
+*.mp3
+*.flac
+*.png
+*.jpg
+*.jpeg
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+~*
+
