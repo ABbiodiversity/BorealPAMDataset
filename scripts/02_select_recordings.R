@@ -1,144 +1,146 @@
-# Spatially thin eligible recordings and retain their annotation tags.
+# This script selects recordings for the dataset. It first prioritizes
+# recordings with existing verified or rated tags, samples one recording per
+# location and time-of-day stratum, spatially thins locations with a 2 km grid,
+# clips tags to the first 180 seconds, and attaches recording URLs.
 #
-# Usage:
-#   Rscript scripts/02_select_recordings.R <prepared.rds> <output.rds>
+# This consolidates the former general and CWS-PRA selection scripts; the same
+# code can be run with either set of external inputs.
 #
-# The output RDS is a named list containing the selected recordings and tags.
+# Run from the repository root with:
+# Rscript scripts/02_select_recordings.R recordings.rds filtered_main.rds \
+#   filtered_recording.rds selected_dataset.Rdata
 
-suppressPackageStartupMessages({
-  library(dggridR)
-  library(dplyr)
-})
+library(tidyverse)
+library(dggridR)
 
-arguments <- commandArgs(trailingOnly = TRUE)
-command_line <- commandArgs(trailingOnly = FALSE)
-script_argument <- grep("^--file=", command_line, value = TRUE)
-script_dir <- dirname(normalizePath(
-  sub("^--file=", "", script_argument),
-  mustWork = TRUE
-))
-source(file.path(script_dir, "lib", "pipeline_helpers.R"))
+args <- commandArgs(trailingOnly = TRUE)
 
-require_arguments(
-  arguments,
-  2,
-  "Rscript scripts/02_select_recordings.R <prepared.rds> <output.rds>"
-)
+# Get the things ----
+recordings <- readRDS(args[1])
 
-prepared <- read_named_bundle(
-  arguments[[1]],
-  c("recordings", "tags", "recording_report")
-)
-recordings <- prepared$recordings
-tags <- prepared$tags |>
+tags <- readRDS(args[2]) %>%
   dplyr::select(
-    "recording_id", "task_id", "species_code", "species_common_name",
-    "species_scientific_name", "individual_order", "tag_id", "abundance",
-    "vocalization", "detection_time", "tag_duration", "rms_peak_dbfs",
-    "tag_is_verified", "tag_rating", "observer_id"
+    recording_id, task_id, species_code:tag_rating, observer_id
   )
 
-assert_unique(recordings, "recording_id", "eligible recordings")
+# Merge the things ----
+all <- inner_join(recordings, tags)
 
-selected_tag_pool <- tags |>
-  dplyr::semi_join(
-    dplyr::select(recordings, "recording_id", "task_id"),
-    by = c("recording_id", "task_id")
+# ID recordings with validation and tag rating ----
+verified <- all %>%
+  dplyr::filter(tag_is_verified == TRUE) %>%
+  group_by(task_id) %>%
+  summarize(total_tags = n()) %>%
+  unique()
+
+rated <- all %>%
+  dplyr::filter(!is.na(tag_rating)) %>%
+  group_by(task_id) %>%
+  summarize(total_tags = n()) %>%
+  unique()
+
+recordings_verified <- recordings %>%
+  mutate(
+    verified = ifelse(task_id %in% verified$task_id, 1, 0),
+    rated = ifelse(task_id %in% rated$task_id, 1, 0)
   )
 
-verified_tasks <- selected_tag_pool |>
-  dplyr::filter(.data$tag_is_verified %in% TRUE) |>
-  dplyr::distinct(.data$task_id) |>
-  dplyr::pull(.data$task_id)
-
-rated_tasks <- selected_tag_pool |>
-  dplyr::filter(!is.na(.data$tag_rating)) |>
-  dplyr::distinct(.data$task_id) |>
-  dplyr::pull(.data$task_id)
-
-# Preserve the original recording order because the seeded sampling depends on it.
-selected_pool <- recordings |>
-  dplyr::mutate(
-    verified = as.integer(.data$task_id %in% verified_tasks),
-    rated = as.integer(.data$task_id %in% rated_tasks)
-  )
-
+# Select the things ----
+# Take verified ones first.
 set.seed(1)
-verified_first <- selected_pool |>
-  dplyr::filter(.data$verified == 1) |>
-  dplyr::group_by(.data$location, .data$time_of_day) |>
-  dplyr::sample_n(1, replace = FALSE) |>
-  dplyr::ungroup()
+every1 <- recordings_verified %>%
+  dplyr::filter(verified == 1) %>%
+  group_by(location, time_of_day) %>%
+  sample_n(1, replace = FALSE) %>%
+  ungroup()
 
 set.seed(2)
-one_per_location_period <- selected_pool |>
-  dplyr::filter(.data$verified == 0) |>
-  dplyr::bind_rows(verified_first) |>
-  dplyr::group_by(.data$location, .data$time_of_day) |>
-  dplyr::sample_n(1, replace = FALSE) |>
-  dplyr::ungroup()
+every2 <- recordings_verified %>%
+  dplyr::filter(verified == 0) %>%
+  rbind(every1) %>%
+  group_by(location, time_of_day) %>%
+  sample_n(1, replace = FALSE) %>%
+  ungroup()
 
-grid <- dggridR::dgconstruct(spacing = 2, metric = TRUE)
+# Thin the things ----
+grid <- dgconstruct(spacing = 2, metric = TRUE)
 
-location_counts <- one_per_location_period |>
-  dplyr::count(
-    .data$bcr,
-    .data$organization,
-    .data$project_id,
-    .data$location_id,
-    .data$longitude,
-    .data$latitude,
-    name = "recordings"
-  ) |>
-  dplyr::mutate(
-    cell = dggridR::dgGEO_to_SEQNUM(
+# First calculate recording counts per location.
+location_counts <- every2 %>%
+  group_by(
+    bcr,
+    organization,
+    project_id,
+    location_id,
+    longitude,
+    latitude
+  ) %>%
+  summarize(
+    recordings = n(),
+    .groups = "drop"
+  ) %>%
+  # Assign each location to a spatial cell.
+  mutate(
+    cell = dgGEO_to_SEQNUM(
       grid,
-      .data$longitude,
-      .data$latitude
+      longitude,
+      latitude
     )$seqnum
   )
 
+# Within each cell:
+# 1. Keep locations with the maximum number of recordings.
+# 2. Randomly select one if ties exist.
 set.seed(3)
-selected_locations <- location_counts |>
-  dplyr::group_by(.data$bcr, .data$organization, .data$cell) |>
-  dplyr::filter(.data$recordings == max(.data$recordings)) |>
-  dplyr::sample_n(1) |>
-  dplyr::ungroup()
 
-recordings_selected <- one_per_location_period |>
-  dplyr::semi_join(
+selected_locations <- location_counts %>%
+  group_by(bcr, organization, cell) %>%
+  filter(recordings == max(recordings)) %>%
+  sample_n(1) %>%
+  ungroup()
+
+# Rejoin selected locations back to recordings.
+every3 <- every2 %>%
+  semi_join(
     selected_locations,
     by = c(
-      "bcr", "organization", "project_id", "location_id",
-      "longitude", "latitude"
+      "bcr",
+      "organization",
+      "project_id",
+      "location_id",
+      "longitude",
+      "latitude"
     )
-  )
+  ) %>%
+  inner_join(recordings)
 
-tags_selected <- tags |>
-  dplyr::semi_join(
-    dplyr::select(recordings_selected, "recording_id", "task_id"),
-    by = c("recording_id", "task_id")
-  ) |>
-  dplyr::mutate(detection_end = .data$detection_time + .data$tag_duration) |>
-  dplyr::filter(.data$detection_end < 180) |>
-  dplyr::distinct()
+# Wrangle for saving: clip tags to under three minutes ----
+tags_use <- tags %>%
+  dplyr::filter(task_id %in% every3$task_id) %>%
+  mutate(detection_end = detection_time + tag_duration) %>%
+  dplyr::filter(detection_end < 180) %>%
+  unique()
 
-recording_urls <- prepared$recording_report |>
-  dplyr::select("recording_id", "source_file_name", "recording_url") |>
-  dplyr::distinct(.data$recording_id, .keep_all = TRUE)
+# Look at some things ----
+ggplot(every3) +
+  geom_hex(aes(x = longitude, y = latitude))
 
-recordings_selected <- recordings_selected |>
-  dplyr::left_join(
-    recording_urls,
-    by = "recording_id",
-    relationship = "one-to-one"
-  ) |>
-  dplyr::distinct()
+ggplot(every3) +
+  geom_hex(aes(x = longitude, y = latitude)) +
+  facet_wrap(~time_of_day)
 
-assert_unique(recordings_selected, "recording_id", "selected recordings")
-assert_unique(tags_selected, "tag_id", "selected tags")
+################################################################################
+# Add recording_URL to dataset ----
+filter_df_rec <- readRDS(args[3])
 
-write_rds(
-  list(recordings = recordings_selected, tags = tags_selected),
-  arguments[[2]]
-)
+recordings_use <- every3 %>%
+  left_join(
+    filter_df_rec %>%
+      select(recording_id, source_file_name, recording_url),
+    by = "recording_id"
+  ) %>%
+  unique()
+
+# Save datasets ----
+save(recordings_use, tags_use, file = args[4])
+

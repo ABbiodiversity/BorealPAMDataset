@@ -1,170 +1,352 @@
-# Clean WildTrax reports and identify eligible boreal recordings.
+# This script takes the filtered main and recording reports and whittles them
+# down to a dataframe of recordings. It calculates sunrise and sunset times,
+# labels recordings as sunrise, dawn, sunset, night, or day, assigns BCRs, and
+# restricts the data to the Canadian boreal zone and the target date window.
 #
-# Usage:
-#   Rscript scripts/01_prepare_recordings.R \
-#     <wildtrax_main.rds> <wildtrax_recording.rds> \
-#     <boreal_boundary> <bcr_boundary> <output.rds>
-#
-# The output RDS is a named list containing recordings, tags, and the filtered
-# recording report used by the next stage.
+# Run from the repository root with:
+# Rscript scripts/01_prepare_recordings.R filtered_main.rds \
+#   filtered_recording.rds boreal_boundary.shp bcr_boundary.shp output.rds
 
-suppressPackageStartupMessages({
-  library(dplyr)
-  library(hms)
-  library(lubridate)
-  library(lutz)
-  library(purrr)
-  library(sf)
-  library(stringr)
-  library(suncalc)
-  library(wildrtrax)
-})
+library(tidyverse)
+library(wildrtrax)
+library(lutz)
+library(purrr)
+library(suncalc)
+library(lubridate)
+library(hms)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(ggplot2)
 
-arguments <- commandArgs(trailingOnly = TRUE)
-command_line <- commandArgs(trailingOnly = FALSE)
-script_argument <- grep("^--file=", command_line, value = TRUE)
-script_directory <- dirname(normalizePath(
-  sub("^--file=", "", script_argument),
-  mustWork = TRUE
-))
-source(file.path(script_directory, "lib", "pipeline_helpers.R"))
-source(file.path(script_directory, "lib", "selection_helpers.R"))
+args <- commandArgs(trailingOnly = TRUE)
+filter_df <- readRDS(args[1])
+rec_df <- readRDS(args[2])
+boreal_canada <- st_read(args[3])
+bcr <- read_sf(args[4])
+output_file <- args[5]
 
-require_arguments(
-  arguments,
-  5,
-  paste(
-    "Rscript scripts/01_prepare_recordings.R",
-    "<wildtrax_main.rds> <wildtrax_recording.rds>",
-    "<boreal_boundary> <bcr_boundary> <output.rds>"
-  )
-)
+################################################################################
+# Debugged version of the WildTrax TMTT replacement function ----
+# This function was retained from 0_wildrtrax_functions.R in the original repo.
+wt_replace_tmtt <- function(data, calc = "round") {
 
-main_report <- readRDS(normalizePath(arguments[[1]], mustWork = TRUE))
-recording_report <- readRDS(normalizePath(arguments[[2]], mustWork = TRUE))
-boreal_boundary <- sf::st_read(arguments[[3]], quiet = TRUE)
-bcr_boundary <- sf::st_read(arguments[[4]], quiet = TRUE)
+  if (!"recording_date_time" %in% colnames(data)) {
+    stop("The `wt_replace_tmtt` function only works on data from the ARU sensor")
+  }
 
-assert_columns(
-  main_report,
-  c(
-    "organization", "project_id", "location", "location_id", "longitude",
-    "latitude", "recording_id", "recording_date_time", "task_id",
-    "task_duration", "task_method", "species_code"
-  ),
-  "WildTrax main report"
-)
-assert_columns(
-  recording_report,
-  c("recording_id", "task_id", "task_noise", "source_file_name", "recording_url"),
-  "WildTrax recording report"
-)
+  check_none <- data %>%
+    select(species_code) %>%
+    distinct() %>%
+    pull()
 
-# These filters reproduce the thresholds used for the submitted dataset.
-# Task-completion status is intentionally not filtered: the historical selected
-# dataset contains two tasks marked incomplete, and this code documents that
-# released dataset rather than defining a revised selection.
-eligible_main <- main_report |>
-  dplyr::filter(
-    .data$task_duration > 178,
-    .data$task_method %in% c("1SPT", "1SPM")
+  if (length(check_none) == 1 && check_none == "NONE") {
+    stop("There are no species in this project")
+  }
+
+  .tmtt <- readRDS(
+    system.file("extdata", "tmtt_predictions.rds", package = "wildrtrax")
   )
 
-eligible_recording_report <- recording_report |>
-  dplyr::filter(
-    .data$task_duration > 178,
-    .data$task_method %in% c("1SPT", "1SPM")
+  dat.tmtt <- mutate(data, id = row_number())
+
+  # Only TMTT rows for replacement.
+  dat.tmt <- dat.tmtt %>% filter(abundance %in% c("TMTT", "TNPE"))
+
+  if (nrow(dat.tmt) > 0) {
+    dat.tmt <- dat.tmt %>%
+      rename(species_code_og = species_code) %>%
+      mutate(
+        species_code = ifelse(
+          species_code_og %in% .tmtt$species_code,
+          species_code_og,
+          "species"
+        ),
+        observer_id = as.integer(
+          ifelse(observer_id %in% .tmtt$observer_id, observer_id, 0)
+        )
+      ) %>%
+      inner_join(
+        .tmtt %>% select(species_code, observer_id, pred),
+        by = c("species_code", "observer_id")
+      ) %>%
+      mutate(
+        abundance = case_when(
+          calc == "round" ~ round(pred),
+          calc == "ceiling" ~ ceiling(pred),
+          calc == "floor" ~ floor(pred),
+          TRUE ~ NA_real_
+        ),
+        species_code = species_code_og
+      ) %>%
+      select(-pred, -species_code_og)
+  }
+
+  # Replace TMTT rows with predictions.
+  dat.tmtt <- suppressWarnings(
+    dat.tmtt %>%
+      mutate(
+        abundance = case_when(
+          abundance %in% c("TMTT", "TNPE") ~ NA_real_,
+          TRUE ~ as.numeric(abundance)
+        )
+      ) %>%
+      rows_update(dat.tmt, by = c("id")) %>%
+      select(-id)
   )
 
-tidy_tags <- eligible_main |>
-  wildrtrax::wt_tidy_species(
-    remove = c("abiotic", "insect", "human", "unknown")
-  ) |>
+  return(dat.tmtt)
+}
+
+################################################################################
+# Tidy tags and identify usable recordings ----
+
+# Tidy the tags.
+tags <- filter_df %>%
+  wt_tidy_species(remove = c("abiotic", "insect", "human", "unknown")) %>%
   wt_replace_tmtt()
 
-recording_noise <- eligible_recording_report |>
-  dplyr::select("recording_id", "task_id", "task_noise") |>
-  dplyr::distinct()
-
-excluded_project_ids <- c(
-  3524, 2813, 2350, 2115, 2423, 2812,
-  1650, 1260, 691, 1136, 3236, 41
-)
-
-recordings <- tidy_tags |>
-  dplyr::left_join(
-    recording_noise,
-    by = c("recording_id", "task_id"),
-    relationship = "many-to-many"
-  ) |>
+# Simplify dataframe and reduce it to one row per recording_id.
+# Do some filtering, including removing projects known not to be usable.
+# Project 41 has only YERA tags.
+recordings_all <- tags %>%
+  left_join(rec_df, multiple = "all") %>%
   dplyr::filter(
-    .data$species_code != "NONE",
-    !stringr::str_detect(.data$task_noise, "ARU Malfunction|Extreme|High"),
-    !is.na(.data$latitude),
-    !is.na(.data$longitude)
-  ) |>
-  dplyr::mutate(project_id = as.numeric(.data$project_id)) |>
-  dplyr::filter(!.data$project_id %in% excluded_project_ids) |>
-  dplyr::select(
-    "organization", "project_id", "location", "location_id", "longitude",
-    "latitude", "recording_id", "recording_date_time", "task_id",
-    "task_duration", "task_method", "task_noise"
-  ) |>
-  dplyr::distinct(.data$recording_id, .keep_all = TRUE) |>
-  add_solar_periods() |>
+    species_code != "NONE",
+    !str_detect(task_noise, "ARU Malfunction"),
+    !str_detect(task_noise, "Extreme"),
+    !str_detect(task_noise, "High"),
+    !is.na(latitude),
+    !is.na(longitude)
+  ) %>%
+  mutate(project_id = as.numeric(project_id)) %>%
   dplyr::filter(
-    !.data$timezone_group %in% c("Asia/Irkutsk", "Asia/Shanghai", "Europe/Paris")
+    !project_id %in% c(
+      3524, 2813, 2350, 2115, 2423, 2812,
+      1650, 1260, 691, 1136, 3236, 41
+    )
+  ) %>%
+  select(
+    organization, project_id, location, location_id, longitude, latitude,
+    recording_id, recording_date_time, task_id, task_duration, task_method,
+    task_noise
+  ) %>%
+  distinct(recording_id, .keep_all = TRUE)
+
+# 1. Add timezone per location ----
+recordings_tz <- recordings_all %>%
+  mutate(
+    timezone_raw = tz_lookup_coords(
+      lat = latitude,
+      lon = longitude,
+      method = "accurate"
+    ),
+    timezone = sub(";.*", "", timezone_raw)
   )
 
-recording_points <- sf::st_as_sf(
-  recordings,
+# 2. Split dataframe into a list by timezone ----
+recordings_list <- split(recordings_tz, recordings_tz$timezone)
+
+# 3. Work within each timezone to apply the timezone to the recording time and
+# get sunrise, sunset, time-of-day, and month values ----
+recordings_list_calculations <- map(recordings_list, function(x) {
+  tz <- unique(x$timezone)
+
+  # Step 1: ensure POSIXct and localize, keeping the original as character.
+  x <- x %>%
+    mutate(
+      recording_date_time_char = as.character(recording_date_time),
+      recording_date_time_char = if_else(
+        nchar(recording_date_time_char) == 10,
+        paste0(recording_date_time_char, " 00:00:00"),
+        recording_date_time_char
+      ),
+      # Convert to POSIXct in UTC, then assign local timezone without shifting
+      # the clock time.
+      recording_date_time_posixct = as.POSIXct(
+        recording_date_time_char,
+        tz = "UTC"
+      ),
+      recording_date_time_local = force_tz(recording_date_time_posixct, tz),
+      recording_date = as.Date(recording_date_time_local, tz = tz),
+      recording_time = as_hms(recording_date_time_local)
+    )
+
+  # Step 2: get sunrise and sunset values for each row.
+  sun_times <- getSunlightTimes(
+    data = data.frame(
+      date = x$recording_date,
+      lat = x$latitude,
+      lon = x$longitude
+    ),
+    keep = c(
+      "nightEnd", "nauticalDawn", "dawn", "sunrise", "goldenHourEnd",
+      "goldenHour", "sunset", "dusk", "nauticalDusk", "night", "nadir"
+    ),
+    tz = tz
+  )
+
+  # Step 3: attach sunrise and sunset calculations.
+  x <- bind_cols(
+    x,
+    sun_times %>%
+      select(
+        nightEnd, nauticalDawn, dawn, sunrise, goldenHourEnd, goldenHour,
+        sunset, dusk, nauticalDusk, night, nadir
+      )
+  )
+
+  # Step 4: convert date-times into time values for comparisons.
+  x <- x %>%
+    mutate(
+      rec_time_local = as_hms(recording_date_time_local),
+      dawn_t = as_hms(dawn),
+      sunrise_t = as_hms(sunrise),
+      goldenHourEnd_t = as_hms(goldenHourEnd),
+      goldenHour_t = as_hms(goldenHour),
+      sunset_t = as_hms(sunset),
+      dusk_t = as_hms(dusk),
+      nadir_t = as_hms(nadir)
+    )
+
+  # Step 5: classify recordings into time-of-day categories.
+  x <- x %>%
+    mutate(
+      time_of_day = case_when(
+        # 1. Sunrise window: within golden hour.
+        !is.na(dawn_t) &
+          rec_time_local >= dawn_t &
+          rec_time_local <= goldenHourEnd_t ~ "sunrise",
+        # 2. When there is no dawn, use nadir to the end of golden hour.
+        is.na(dawn_t) &
+          !is.na(sunrise_t) &
+          rec_time_local >= nadir_t &
+          rec_time_local <= goldenHourEnd_t ~ "sunrise",
+        # 3. When there is no sunrise, use golden hours after nadir.
+        is.na(sunrise_t) &
+          rec_time_local >= nadir_t &
+          rec_time_local <= goldenHourEnd_t ~ "sunrise",
+        # 4. Dawn: from the end of golden hour to five hours after sunrise.
+        !is.na(sunrise_t) &
+          rec_time_local > goldenHourEnd_t &
+          rec_time_local <= (sunrise_t + (5 * 3600)) ~ "dawn",
+        # 5. Define dawn from nadir when there is no sunrise.
+        is.na(dawn_t) &
+          is.na(sunrise_t) &
+          rec_time_local >= nadir_t &
+          rec_time_local <= (nadir_t + (5 * 3600)) ~ "dawn",
+        # 6. Sunset: evening golden hour to dusk before midnight.
+        !is.na(dusk_t) &
+          dusk_t > goldenHour_t &
+          rec_time_local >= goldenHour_t &
+          rec_time_local <= dusk_t ~ "sunset",
+        # 7. Sunset when dusk occurs after midnight.
+        !is.na(dusk_t) &
+          dusk_t < goldenHour_t &
+          (rec_time_local >= goldenHour_t | rec_time_local <= dusk_t) ~
+          "sunset",
+        # 8. No dusk: golden hour to nadir, where nadir is before midnight.
+        is.na(dusk_t) &
+          nadir_t > goldenHour_t &
+          rec_time_local >= goldenHour_t &
+          rec_time_local < nadir_t ~ "sunset",
+        # 9. No dusk: golden hour to nadir, where nadir is after midnight.
+        is.na(dusk_t) &
+          nadir_t < goldenHour_t &
+          (rec_time_local >= goldenHour_t | rec_time_local < nadir_t) ~
+          "sunset",
+        # 10. Night: between dusk and dawn on either side of midnight.
+        !is.na(dusk_t) & !is.na(dawn_t) &
+          if_else(
+            dusk_t < dawn_t,
+            rec_time_local >= dusk_t & rec_time_local <= dawn_t,
+            rec_time_local >= dusk_t | rec_time_local <= dawn_t
+          ) ~ "night",
+        # 11. All remaining cases are daytime.
+        TRUE ~ "day"
+      ),
+      month = month(recording_date, label = TRUE)
+    )
+
+  return(x)
+})
+
+# 4. Combine timezones and remove erroneous Asia and Europe locations ----
+recordings_combined <- bind_rows(
+  recordings_list_calculations,
+  .id = "timezone_group"
+) %>%
+  filter(!timezone_group %in% c("Asia/Irkutsk", "Asia/Shanghai", "Europe/Paris")) %>%
+  dplyr::select(-c(timezone_raw, recording_date_time_char, recording_date_time_local:night))
+
+# 5. Clip to the Canadian boreal zone ----
+# Convert recordings to sf points.
+recordings_locations <- st_as_sf(
+  recordings_combined,
   coords = c("longitude", "latitude"),
   crs = 4326,
   remove = FALSE
-) |>
-  sf::st_transform(sf::st_crs(boreal_boundary))
-
-recordings_boreal <- sf::st_join(
-  recording_points,
-  boreal_boundary,
-  left = FALSE
 )
 
-bcr_for_join <- sf::st_transform(bcr_boundary, sf::st_crs(recordings_boreal))
-assert_columns(bcr_for_join, "name_en", "BCR boundary")
+# Make sure the shapefile and points have the same CRS.
+recordings_locations <- st_transform(
+  recordings_locations,
+  crs = st_crs(boreal_canada)
+)
 
-recordings_bcr <- sf::st_join(
-  recordings_boreal,
-  dplyr::select(bcr_for_join, "name_en"),
-  left = FALSE
-) |>
-  sf::st_drop_geometry() |>
-  dplyr::rename(bcr = "name_en") |>
-  dplyr::distinct(.data$recording_id, .keep_all = TRUE)
+# Join spatial layers to retain locations inside the boreal shapefile.
+recordings_boreal <- st_join(recordings_locations, boreal_canada) %>%
+  filter(!is.na(TYPE))
 
-tag_counts <- eligible_main |>
-  dplyr::filter(.data$species_code != "NONE") |>
-  dplyr::count(.data$task_id, name = "tags")
-
-recordings_out <- recordings_bcr |>
-  dplyr::inner_join(tag_counts, by = "task_id", relationship = "one-to-one") |>
-  dplyr::mutate(doy = lubridate::yday(.data$recording_date_time)) |>
-  dplyr::filter(
-    .data$doy > 151,
-    .data$doy < 186,
-    .data$time_of_day != "day",
-    !(.data$tags == 1 & .data$time_of_day %in% c("sunrise", "dawn"))
+# Check the spatial filtering.
+ggplot() +
+  geom_point(
+    data = recordings_locations,
+    aes(x = longitude, y = latitude),
+    colour = "grey"
+  ) +
+  geom_point(
+    data = recordings_boreal,
+    aes(x = longitude, y = latitude),
+    colour = "green"
   )
 
-assert_unique(recordings_out, "recording_id", "eligible recordings")
+# 6. Assign Bird Conservation Regions ----
+bcr <- bcr %>%
+  st_transform(terra::crs(recordings_boreal))
 
-write_rds(
-  list(
-    recordings = recordings_out,
-    # Keep the eligible main report for selection, matching the historical
-    # pipeline; the tidied copy above is used only to identify recordings.
-    tags = eligible_main,
-    recording_report = eligible_recording_report
-  ),
-  arguments[[5]]
-)
+locations_boreal <- recordings_boreal %>%
+  dplyr::select(location_id, latitude, longitude, geometry) %>%
+  unique()
+
+locations_bcr <- locations_boreal %>%
+  st_intersection(bcr) %>%
+  st_drop_geometry() %>%
+  dplyr::select(location_id, name_en) %>%
+  rename(bcr = name_en)
+
+recordings_bcr <- recordings_boreal %>%
+  st_drop_geometry() %>%
+  inner_join(locations_bcr)
+
+# 7. Final temporal filtering ----
+# Apply the target dates and time-of-day limits. Recordings with only one tag at
+# sunrise or dawn were removed. Tasks from project 41 only had YERA annotated
+# and were already removed above.
+recordings_out <- recordings_bcr %>%
+  left_join(filter_df %>% mutate(project_id = as.numeric(project_id))) %>%
+  dplyr::filter(species_code != "NONE") %>%
+  group_by(task_id) %>%
+  summarize(tags = n()) %>%
+  ungroup() %>%
+  left_join(recordings_bcr) %>%
+  mutate(doy = yday(recording_date_time)) %>%
+  dplyr::filter(
+    doy > 151,
+    doy < 186,
+    time_of_day != "day",
+    !(tags == 1 & time_of_day %in% c("sunrise", "dawn"))
+  )
+
+saveRDS(recordings_out, output_file)
+
